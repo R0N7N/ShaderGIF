@@ -42,6 +42,7 @@ out vec4 fragColor;
 #define IMG_THIS_PIXEL(sampler) texture(sampler, isf_FragNormCoord)
 #define IMG_NORM_PIXEL(sampler, coord) texture(sampler, coord)
 #define IMG_PIXEL(sampler, coord) texture(sampler, coord)
+#define IMG_THIS_NORM_PIXEL(sampler) texture(sampler, isf_FragNormCoord)
 """
 
 
@@ -53,7 +54,7 @@ TYPE_TO_GLSL = {
     "point2D": "vec2",
     "point3D": "vec3",
     "color": "vec3",
-    "event": "float",
+    "event": "bool",  # event types are typically used as boolean triggers
     "image": "sampler2D",
 }
 
@@ -207,8 +208,9 @@ def extract_buffer_names(metadata: Dict[str, Any]) -> List[str]:
     return buffer_names
 
 
-def needs_uniform_declaration(name: str, shader_source: str) -> bool:
-    # Check if uniform is already declared - look for "uniform <type> <name>" pattern
+def needs_uniform_declaration(name: str, shader_source: str, is_input: bool = False) -> bool:
+    # Check if uniform or variable is already declared
+    # Look for "uniform <type> <name>" or "<type> <name> = " patterns
     # Ignore comments to avoid false matches
     lines = shader_source.split('\n')
     code_lines = []
@@ -219,8 +221,24 @@ def needs_uniform_declaration(name: str, shader_source: str) -> bool:
         code_lines.append(line)
     code_without_comments = '\n'.join(code_lines)
     
-    pattern = rf"\buniform\s+[a-zA-Z0-9_]+\s+{re.escape(name)}\b"
-    return re.search(pattern, code_without_comments, re.MULTILINE) is None
+    # Check for uniform declaration
+    uniform_pattern = rf"\buniform\s+[a-zA-Z0-9_]+\s+{re.escape(name)}\b"
+    if re.search(uniform_pattern, code_without_comments, re.MULTILINE):
+        return False
+    
+    # For input parameters from metadata, always declare as uniform even if variable exists
+    # (the variable might be defined later, but we need the uniform first)
+    if is_input:
+        # Still check if uniform is already declared
+        return True
+    
+    # Check for variable declaration (e.g., "vec3 iResolution = " or "float iTime = ")
+    # Only skip uniform declaration if it's NOT an input parameter
+    variable_pattern = rf"\b[a-zA-Z0-9_]+\s+{re.escape(name)}\s*="
+    if re.search(variable_pattern, code_without_comments, re.MULTILINE):
+        return False
+    
+    return True
 
 
 def build_fragment_shader(
@@ -232,25 +250,42 @@ def build_fragment_shader(
     declarations = [DEFAULT_FRAGMENT_PREFIX.strip()]
     processed: set[str] = set()
 
-    def add_uniform(name: str, glsl_type: str) -> None:
+    def add_uniform(name: str, glsl_type: str, is_input: bool = False) -> None:
         if name in processed:
             return
         processed.add(name)
-        if needs_uniform_declaration(name, source):
+        if needs_uniform_declaration(name, source, is_input):
             declarations.append(f"uniform {glsl_type} {name};")
 
     # Check if RENDERSIZE is used as vec2 (direct multiplication/operation with vec2)
-    # If RENDERSIZE.xy, RENDERSIZE.x, etc. is used, it's vec3
+    # If RENDERSIZE.xy, RENDERSIZE.xz, RENDERSIZE.yz, or RENDERSIZE.z is used, it's vec3
+    # Note: RENDERSIZE.x and RENDERSIZE.y work on both vec2 and vec3, so don't use those to detect
     # If RENDERSIZE is used directly in multiplication, it might be vec2
-    has_rendersize_accessor = bool(re.search(r'\bRENDERSIZE\s*\.(xy|xz|yz|x|y|z)\b', source))
+    # If vec3(RENDERSIZE, ...) is used, RENDERSIZE must be vec2
+    has_rendersize_accessor = bool(re.search(r'\bRENDERSIZE\s*\.(xy|xz|yz|z)\b', source))
+    
+    # Check for constructor usage: vec3(RENDERSIZE, ...) means RENDERSIZE is vec2
+    uses_rendersize_in_vec3_constructor = bool(re.search(r'\bvec3\s*\(\s*RENDERSIZE\s*,', source))
     
     # Check for direct vec2 operations with RENDERSIZE (without accessors)
+    # Also check for operations like "vec2 - RENDERSIZE" or "gl_FragCoord.xy - RENDERSIZE"
     uses_rendersize_as_vec2 = False
     if not has_rendersize_accessor:
         uses_rendersize_as_vec2 = bool(
-            re.search(r'\b(vec2|isf_FragNormCoord)\s*[*+-]\s*RENDERSIZE\b', source) or
-            re.search(r'\bRENDERSIZE\s*[*+-]\s*(vec2|isf_FragNormCoord)\b', source) or
-            re.search(r'\bRENDERSIZE\s*[*+-]\s*\w+\s*[*+-]\s*RENDERSIZE\b', source)
+            re.search(r'\b(vec2|isf_FragNormCoord|gl_FragCoord\.xy)\s*[*+-/]\s*RENDERSIZE\b', source) or
+            re.search(r'\b(isf_FragNormCoord|vv_FragNormCoord|gl_FragCoord)\.xy\s*[*+-/]\s*RENDERSIZE\b', source) or
+            re.search(r'\bRENDERSIZE\s*[*+-/]\s*(vec2|isf_FragNormCoord|gl_FragCoord\.xy)\b', source) or
+            re.search(r'\bRENDERSIZE\s*[*+-/]\s*(isf_FragNormCoord|vv_FragNormCoord|gl_FragCoord)\.xy\b', source) or
+            re.search(r'\bRENDERSIZE\s*[*+-]\s*\w+\s*[*+-]\s*RENDERSIZE\b', source) or
+            uses_rendersize_in_vec3_constructor or
+            # Check for subtraction/addition with vec2 expressions like "gl_FragCoord.xy - 0.5*RENDERSIZE"
+            re.search(r'\.xy\s*[-+/]\s*[^)]*\s*[*]\s*RENDERSIZE\b', source) or
+            re.search(r'[0-9.]+\s*[*]\s*RENDERSIZE\s*[)/]', source) or
+            # Check for operations where vec2 is subtracted from or added to RENDERSIZE
+            re.search(r'\([^)]*\.xy\s*[-+]\s*[^)]*RENDERSIZE', source) or
+            # Check for division operations like "gl_FragCoord.xy / RENDERSIZE"
+            re.search(r'\.xy\s*/\s*RENDERSIZE\b', source) or
+            re.search(r'\bRENDERSIZE\s*/\s*\.xy\b', source)
         )
     
     required_uniforms = {
@@ -289,7 +324,7 @@ def build_fragment_shader(
             if color_uses_alpha or default_has_alpha:
                 glsl_type = "vec4"
         
-        add_uniform(shader_input.name, glsl_type)
+        add_uniform(shader_input.name, glsl_type, is_input=True)
     
     # Add ISF buffer uniforms (from PASSES metadata)
     if metadata:
@@ -320,6 +355,11 @@ def build_fragment_shader(
         isf_lines.append("vec2 isf_FragCoord = gl_FragCoord.xy;")
     if not is_isf_variable_declared("isf_FragNormCoord", source):
         isf_lines.append("vec2 isf_FragNormCoord = gl_FragCoord.xy / RENDERSIZE.xy;")
+    # VIDVOX ISF built-in variables (same as ISF but with vv_ prefix)
+    if not is_isf_variable_declared("vv_FragCoord", source):
+        isf_lines.append("vec2 vv_FragCoord = gl_FragCoord.xy;")
+    if not is_isf_variable_declared("vv_FragNormCoord", source):
+        isf_lines.append("vec2 vv_FragNormCoord = gl_FragCoord.xy / RENDERSIZE.xy;")
     if isf_lines:
         declarations.append("// ISF convenience variables")
         declarations.extend(isf_lines)
@@ -396,8 +436,8 @@ def convert_default_value(shader_input: ShaderInput) -> Any:
     default = shader_input.default
     type_ = shader_input.type
     
-    # Handle bool type - must be integer (0 or 1) in GLSL
-    if type_ == "bool":
+    # Handle bool and event types - must be integer (0 or 1) in GLSL
+    if type_ in {"bool", "event"}:
         if default is None:
             return 0
         # Convert bool/float/int to 0 or 1
@@ -415,7 +455,7 @@ def convert_default_value(shader_input: ShaderInput) -> Any:
             "point2D": (0.0, 0.0),
             "point3D": (0.0, 0.0, 0.0),
             "color": (1.0, 1.0, 1.0),
-            "event": 0.0,
+            "event": 0,  # event maps to bool, so use 0 (false)
         }.get(type_, 0.0)
     if type_ in {"point2D", "point3D"} and isinstance(default, (list, tuple)):
         return tuple(default[:3])
