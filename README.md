@@ -5,7 +5,7 @@ Render ISF/GLSL fragment shaders (`.fs`) into looping GIF previews directly from
 ## Setup
 
 ```powershell
-cd "C:\Users\schibli\Documents\Cursor Playground\ShaderGIF"
+cd "C:\Users\user\Documents\Cursor Playground\ShaderGIF"
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -15,7 +15,7 @@ pip install -r requirements.txt
 
 ```powershell
 python shader_gif_renderer.py ^
-  "C:\Users\schibli\Documents\HeavyM\ShadersLibrary" ^
+  "C:\Users\user\Documents\HeavyM\ShadersLibrary" ^
   --duration 6 ^
   --fps 30 ^
   --width 768 ^
